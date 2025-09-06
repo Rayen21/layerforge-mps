@@ -1,3 +1,14 @@
+<h1 align="center">在原插件的基础上修改支持MPS加速</h1>
+<p align="left">发现有一个问题模型要先联网从huggingface.co上缓存下来,然后对应缓存的快照目录将blobs中的文件直接改名，放到comfyui/models/BiRefNet下节点才能正常使用模型</p>
+<p align="left">对应关系是这样的：</p>
+<p align="left">../snapshots/6a62b7dcfa18a3829087877fb16c8006831e4220/BiRefNet_config.py 对应../blobs/37c8ac58bec2f52dac34204978a7b61b69e3da76</p>
+<p align="left">../snapshots/6a62b7dcfa18a3829087877fb16c8006831e4220/birefnet.py 对应..//blobs/57eba49a236a93365582e59814641e01f4facaa8</p>
+<p align="left">../snapshots/6a62b7dcfa18a3829087877fb16c8006831e4220/config.json 对应..//blobs/06d8fa9d7f2f4c6f1cf0dc6e7bfd194153176a42</p>
+<p align="left">../snapshots/6a62b7dcfa18a3829087877fb16c8006831e4220/model.safetensors 对应..//blobs/9ab37426bf4de0567af6b5d21b16151357149139362e6e8992021b8ce356a154</p>
+<p align="left">如果没有执行权限通过命令行chmod +x赋予模型文件执行权限</p>
+<p align="center">以下是原作者内容</p>
+
+
 <h1 align="center">LayerForge – Advanced Canvas Editor for ComfyUI 🎨</h1>
 
 
