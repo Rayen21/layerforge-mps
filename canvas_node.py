@@ -326,42 +326,355 @@ class LayerForgeNode:
     # ... 其他路由和方法 (保留原样) ...
     @classmethod
     def api_get_data(cls, node_id):
-        # ...
-        pass
+        try:
+            return {
+                'success': True,
+                'data': cls._canvas_cache
+            }
+        except Exception as e:
+            return {
+                'success': False,
+                'error': str(e)
+            }
 
     @classmethod
     def get_latest_image(cls):
-        # ...
-        pass
-    
+        output_dir = folder_paths.get_output_directory()
+        files = [os.path.join(output_dir, f) for f in os.listdir(output_dir) if
+                 os.path.isfile(os.path.join(output_dir, f))]
+
+        image_files = [f for f in files if f.lower().endswith(('.png', '.jpg', '.jpeg', '.bmp', '.gif'))]
+
+        if not image_files:
+            return None
+
+        latest_image_path = max(image_files, key=os.path.getctime)
+        return latest_image_path
+
     @classmethod
     def get_latest_images(cls, since_timestamp=0):
-        # ...
-        pass
-    
+        output_dir = folder_paths.get_output_directory()
+        files = []
+        for f_name in os.listdir(output_dir):
+            file_path = os.path.join(output_dir, f_name)
+            if os.path.isfile(file_path) and file_path.lower().endswith(('.png', '.jpg', '.jpeg', '.bmp', '.gif')):
+                try:
+                    mtime = os.path.getmtime(file_path)
+                    if mtime > since_timestamp:
+                        files.append((mtime, file_path))
+                except OSError:
+                    continue
+        
+        files.sort(key=lambda x: x[0])
+        
+        return [f[1] for f in files]
+
     @classmethod
     def get_flow_status(cls, flow_id=None):
-        # ...
-        pass
+
+        if flow_id:
+            return cls._canvas_cache['data_flow_status'].get(flow_id)
+        return cls._canvas_cache['data_flow_status']
 
     @classmethod
     def _cleanup_old_websocket_data(cls):
-        # ...
-        pass
+        """Clean up old WebSocket data from invalid nodes or data older than 5 minutes"""
+        try:
+            current_time = time.time()
+            cleanup_threshold = 300  # 5 minutes
+            
+            nodes_to_remove = []
+            for node_id, data in cls._websocket_data.items():
+
+                if node_id < 0:
+                    nodes_to_remove.append(node_id)
+                    continue
+
+                if current_time - data.get('timestamp', 0) > cleanup_threshold:
+                    nodes_to_remove.append(node_id)
+                    continue
+            
+            for node_id in nodes_to_remove:
+                del cls._websocket_data[node_id]
+                log_debug(f"Cleaned up old WebSocket data for node {node_id}")
+            
+            if nodes_to_remove:
+                log_info(f"Cleaned up {len(nodes_to_remove)} old WebSocket entries")
+                
+        except Exception as e:
+            log_error(f"Error during WebSocket cleanup: {str(e)}")
 
     @classmethod
     def setup_routes(cls):
-        # ...
-        pass
+        @PromptServer.instance.routes.get("/layerforge/canvas_ws")
+        async def handle_canvas_websocket(request):
+            ws = web.WebSocketResponse(max_msg_size=33554432)
+            await ws.prepare(request)
+            
+            async for msg in ws:
+                if msg.type == web.WSMsgType.TEXT:
+                    try:
+                        data = msg.json()
+                        node_id = data.get('nodeId')
+                        if not node_id:
+                            await ws.send_json({'status': 'error', 'message': 'nodeId is required'})
+                            continue
+                        
+                        image_data = data.get('image')
+                        mask_data = data.get('mask')
+                        
+                        with cls._storage_lock:
+                            cls._canvas_data_storage[node_id] = {
+                                'image': image_data,
+                                'mask': mask_data,
+                                'timestamp': time.time()
+                            }
+                        
+                        log_info(f"Received canvas data for node {node_id} via WebSocket")
+
+                        ack_payload = {
+                            'type': 'ack',
+                            'nodeId': node_id,
+                            'status': 'success'
+                        }
+                        await ws.send_json(ack_payload)
+                        log_debug(f"Sent ACK for node {node_id}")
+                        
+                    except Exception as e:
+                        log_error(f"Error processing WebSocket message: {e}")
+                        await ws.send_json({'status': 'error', 'message': str(e)})
+                elif msg.type == web.WSMsgType.ERROR:
+                    log_error(f"WebSocket connection closed with exception {ws.exception()}")
+
+            log_info("WebSocket connection closed")
+            return ws
+
+        @PromptServer.instance.routes.get("/layerforge/get_input_data/{node_id}")
+        async def get_input_data(request):
+            try:
+                node_id = request.match_info["node_id"]
+                log_debug(f"Checking for input data for node: {node_id}")
+                
+                with cls._storage_lock:
+                    input_key = f"{node_id}_input"
+                    input_data = cls._canvas_data_storage.get(input_key, None)
+                
+                if input_data:
+                    log_info(f"Input data found for node {node_id}, sending to frontend")
+                    return web.json_response({
+                        'success': True,
+                        'has_input': True,
+                        'data': input_data
+                    })
+                else:
+                    log_debug(f"No input data found for node {node_id}")
+                    return web.json_response({
+                        'success': True,
+                        'has_input': False
+                    })
+                    
+            except Exception as e:
+                log_error(f"Error in get_input_data: {str(e)}")
+                return web.json_response({
+                    'success': False,
+                    'error': str(e)
+                }, status=500)
+
+        @PromptServer.instance.routes.post("/layerforge/clear_input_data/{node_id}")
+        async def clear_input_data(request):
+            try:
+                node_id = request.match_info["node_id"]
+                log_info(f"Clearing input data for node: {node_id}")
+                
+                with cls._storage_lock:
+                    input_key = f"{node_id}_input"
+                    if input_key in cls._canvas_data_storage:
+                        del cls._canvas_data_storage[input_key]
+                        log_info(f"Input data cleared for node {node_id}")
+                    else:
+                        log_debug(f"No input data to clear for node {node_id}")
+                
+                return web.json_response({
+                    'success': True,
+                    'message': f'Input data cleared for node {node_id}'
+                })
+                    
+            except Exception as e:
+                log_error(f"Error in clear_input_data: {str(e)}")
+                return web.json_response({
+                    'success': False,
+                    'error': str(e)
+                }, status=500)
+
+        @PromptServer.instance.routes.get("/ycnode/get_canvas_data/{node_id}")
+        async def get_canvas_data(request):
+            try:
+                node_id = request.match_info["node_id"]
+                log_debug(f"Received request for node: {node_id}")
+
+                cache_data = cls._canvas_cache
+                log_debug(f"Cache content: {cache_data}")
+                log_debug(f"Image in cache: {cache_data['image'] is not None}")
+
+                response_data = {
+                    'success': True,
+                    'data': {
+                        'image': None,
+                        'mask': None
+                    }
+                }
+
+                if cache_data['image'] is not None:
+                    pil_image = cache_data['image']
+                    buffered = io.BytesIO()
+                    pil_image.save(buffered, format="PNG")
+                    img_str = base64.b64encode(buffered.getvalue()).decode()
+                    response_data['data']['image'] = f"data:image/png;base64,{img_str}"
+
+                if cache_data['mask'] is not None:
+                    pil_mask = cache_data['mask']
+                    mask_buffer = io.BytesIO()
+                    pil_mask.save(mask_buffer, format="PNG")
+                    mask_str = base64.b64encode(mask_buffer.getvalue()).decode()
+                    response_data['data']['mask'] = f"data:image/png;base64,{mask_str}"
+
+                return web.json_response(response_data)
+
+            except Exception as e:
+                log_error(f"Error in get_canvas_data: {str(e)}")
+                return web.json_response({
+                    'success': False,
+                    'error': str(e)
+                })
+
+        @PromptServer.instance.routes.get("/layerforge/get-latest-images/{since}")
+        async def get_latest_images_route(request):
+            try:
+                since_timestamp = float(request.match_info.get('since', 0))
+                # JS Timestamps are in milliseconds, Python's are in seconds
+                latest_image_paths = cls.get_latest_images(since_timestamp / 1000.0)
+
+                images_data = []
+                for image_path in latest_image_paths:
+                    with open(image_path, "rb") as f:
+                        encoded_string = base64.b64encode(f.read()).decode('utf-8')
+                        images_data.append(f"data:image/png;base64,{encoded_string}")
+                
+                return web.json_response({
+                    'success': True,
+                    'images': images_data
+                })
+            except Exception as e:
+                log_error(f"Error in get_latest_images_route: {str(e)}")
+                return web.json_response({
+                    'success': False,
+                    'error': str(e)
+                }, status=500)
+
+        @PromptServer.instance.routes.get("/ycnode/get_latest_image")
+        async def get_latest_image_route(request):
+            try:
+                latest_image_path = cls.get_latest_image()
+                if latest_image_path:
+                    with open(latest_image_path, "rb") as f:
+                        encoded_string = base64.b64encode(f.read()).decode('utf-8')
+                    return web.json_response({
+                        'success': True,
+                        'image_data': f"data:image/png;base64,{encoded_string}"
+                    })
+                else:
+                    return web.json_response({
+                        'success': False,
+                        'error': 'No images found in output directory.'
+                    }, status=404)
+            except Exception as e:
+                return web.json_response({
+                    'success': False,
+                    'error': str(e)
+                }, status=500)
+
+        @PromptServer.instance.routes.post("/ycnode/load_image_from_path")
+        async def load_image_from_path_route(request):
+            try:
+                data = await request.json()
+                file_path = data.get('file_path')
+                
+                if not file_path:
+                    return web.json_response({
+                        'success': False,
+                        'error': 'file_path is required'
+                    }, status=400)
+                
+                log_info(f"Attempting to load image from path: {file_path}")
+                
+                # Check if file exists and is accessible
+                if not os.path.exists(file_path):
+                    log_warn(f"File not found: {file_path}")
+                    return web.json_response({
+                        'success': False,
+                        'error': f'File not found: {file_path}'
+                    }, status=404)
+                
+                # Check if it's an image file
+                valid_extensions = ('.png', '.jpg', '.jpeg', '.gif', '.bmp', '.webp', '.tiff', '.tif', '.ico', '.avif')
+                if not file_path.lower().endswith(valid_extensions):
+                    return web.json_response({
+                        'success': False,
+                        'error': f'Invalid image file extension. Supported: {valid_extensions}'
+                    }, status=400)
+                
+                # Try to load and convert the image
+                try:
+                    with Image.open(file_path) as img:
+                        # Convert to RGB if necessary
+                        if img.mode != 'RGB':
+                            img = img.convert('RGB')
+                        
+                        # Convert to base64
+                        buffered = io.BytesIO()
+                        img.save(buffered, format="PNG")
+                        img_str = base64.b64encode(buffered.getvalue()).decode('utf-8')
+                        
+                        log_info(f"Successfully loaded image from path: {file_path}")
+                        return web.json_response({
+                            'success': True,
+                            'image_data': f"data:image/png;base64,{img_str}",
+                            'width': img.width,
+                            'height': img.height
+                        })
+                        
+                except Exception as img_error:
+                    log_error(f"Error processing image file {file_path}: {str(img_error)}")
+                    return web.json_response({
+                        'success': False,
+                        'error': f'Error processing image file: {str(img_error)}'
+                    }, status=500)
+                    
+            except Exception as e:
+                log_error(f"Error in load_image_from_path_route: {str(e)}")
+                return web.json_response({
+                    'success': False,
+                    'error': str(e)
+                }, status=500)
+        
 
     def store_image(self, image_data):
-        # ...
-        pass
+      
+        if isinstance(image_data, str) and image_data.startswith('data:image'):
+            image_data = image_data.split(',')[1]
+            image_bytes = base64.b64decode(image_data)
+            self.cached_image = Image.open(io.BytesIO(image_bytes))
+        else:
+            self.cached_image = image_data
 
     def get_cached_image(self):
-        # ...
-        pass
-
+        
+        if self.cached_image:
+            buffered = io.BytesIO()
+            self.cached_image.save(buffered, format="PNG")
+            img_str = base64.b64encode(buffered.getvalue()).decode()
+            return f"data:image/png;base64,{img_str}"
+        return None
 
 class BiRefNetMatting:
     def __init__(self):
